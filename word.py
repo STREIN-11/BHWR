@@ -350,3 +350,244 @@ model.summary()
 history = model.fit(
         DataGen(x_train, y_train, True, p=1),
         epochs=1,)
+
+
+def load_submodel(model_dir, lmodel):
+    cnt = 0
+    temp_model = tf.keras.models.load_model(model_dir)
+    for i, layer in enumerate(temp_model.layers):
+        try:
+            lmodel.get_layer(layer.name).set_weights(layer.get_weights())
+            print('Layer:', layer.name)
+            cnt += 1
+        except:
+            continue
+    print(f"{cnt} layer weights loaded")
+
+
+class SaveLog(tf.keras.callbacks.Callback):
+    def __init__(self, save_path='./log/', 
+                 save_on_epoch=-1, monitor='loss', mode='auto', 
+                 load_prev=False, patience=5, save_best_model=True,
+                 restore_best_weights=True,
+                 verbose=True):
+        
+        self.os  = __import__('os')
+        self.pkl = __import__('pickle')
+        self.np = __import__('numpy')
+        self.tf = __import__('tensorflow')
+        self.tf.get_logger().setLevel('ERROR')
+        super(SaveLog, self).__init__() 
+        
+        self.save_on_epoch = save_on_epoch
+        if save_on_epoch < -1:
+            raise ValueError("Invalid 'save_on_epoch' value." 
+                             " Should be greater than -1.")
+
+        self.monitor = monitor
+        self.save_dir = None
+        self.log_dir = None
+        self.save_best_model = save_best_model
+        self.patience = patience
+        self.patience_kept = 0
+        self.logs = {}
+        self.load_prev = load_prev
+        self.verbose = verbose
+        self.restore_best_weights = restore_best_weights
+        self.save_path = save_path
+        
+        if mode == 'min':
+            self.monitor_op = self.np.less
+            self.metric_val = self.np.inf
+            self.mode = 'min'
+        elif mode == 'max':
+            self.monitor_op = self.np.greater
+            self.metric_val = -self.np.inf
+            self.mode = 'max'
+        else:
+            if 'acc' in self.monitor:
+                self.monitor_op = self.np.greater
+                self.metric_val = -self.np.inf
+                self.mode = 'max'
+            else:
+                self.monitor_op = self.np.less
+                self.metric_val = self.np.inf
+                self.mode = 'min'
+
+
+    def _save_model(self, best=False):
+        sdir = self.best_dir if best else self.save_dir
+        if best:
+            self.model.save_weights(sdir)
+        else:
+            self.model.save(sdir, overwrite=True)
+        #if self.verbose: 
+        print(f'{"Best m" if best else "M"}odel saved on {sdir}')  
+
+
+    def _load_model(self):
+        try:
+            self.model.load_weights(self.save_dir)
+            if self.verbose: print('Weights loaded')
+            return
+        except:
+            pass
+        try:
+            cnt = 0
+            temp_model = self.tf.keras.models.load_model(self.save_dir)
+            for i, layer in enumerate(temp_model.layers):
+                try:
+                    self.model.get_layer(layer.name).set_weights(layer.get_weights())
+                    cnt += 1
+                except:
+                    continue
+            if self.verbose: print(f"{cnt} layer weights loaded")
+        except:
+            pass
+
+
+    def _save_logs(self, epoch):
+        with open(self.log_dir, 'wb') as f:
+            self.pkl.dump(self.logs, f)
+        if self.verbose: print(f'Logs saved on epoch {epoch+1}')
+
+
+    def _load_logs(self):
+        try:
+            with open(self.log_dir, 'rb') as f:
+                log = self.pkl.load(f)
+            if self.mode == 'max':
+                self.metric_val = max(log[self.monitor])
+            else:
+                self.metric_val = min(log[self.monitor])
+            if self.verbose: print(f'Logs loaded, best {self.monitor}: {self.metric_val:.5f}')
+            return log
+        except:
+            return {}
+
+
+    def _saver(self, epoch, logs):
+        log_val = logs[self.monitor]
+        if self.save_on_epoch == 0:
+            self._save_logs(epoch)
+            self._save_model()
+
+            if self.save_best_model and self.monitor_op(log_val, self.metric_val):
+                self.metric_val = log_val
+                self._save_model(best=True)
+
+        elif self.save_on_epoch == -1:
+            if self.monitor_op(log_val, self.metric_val):
+                self.metric_val = log_val
+                if self.verbose: print('Minimum loss found')
+                self._save_logs(epoch)
+                if self.save_best_model:
+                    self._save_model(best=True)
+        else:
+            if epoch % self.save_on_epoch == 0:
+                self._save_logs(epoch)
+                self._save_model()
+            
+            if self.save_best_model and self.monitor_op(log_val, self.metric_val):
+                self.metric_val = log_val
+                self._save_model(best=True)
+                
+
+    def on_train_begin(self, logs=None):
+        self.save_dir = self.os.path.join(self.save_path, self.model.name, '')
+        self.best_dir = self.os.path.join(self.save_dir, 'best_weight.h5')
+        self.log_dir = self.os.path.join(self.save_dir, 'train_log.pkl')
+         
+        if self.verbose: print('SavePath', self.save_dir)
+        if not self.os.path.exists(self.save_dir):
+            self.os.makedirs(self.save_dir)
+            if self.verbose: print('New directory created')
+        elif self.load_prev:
+            self._load_model()
+            self.logs = self._load_logs() or {}
+
+
+    def on_epoch_end(self, epoch, logs=None):
+        for key, val in logs.items():
+            if key not in self.logs:
+                self.logs[key] = []
+            self.logs[key].append(val)
+        
+        if self.patience != None:
+            if self.monitor_op(logs[self.monitor], self.metric_val):
+                self.patience_kept = 0
+            else:
+                self.patience_kept += 1
+            if self.patience_kept > self.patience:
+                self.model.stop_training = True
+                if self.verbose: print("Stopping training")
+                if self.restore_best_weights:
+                    if self.verbose: print("Restoring best weights")
+                    self.model.load_weights(self.best_dir)
+        
+        self._saver(epoch, logs)
+
+epochs = 1000
+early_stopping_patience = 10
+
+
+dirs = ['C:\\Users\\subha\\OneDrive\\Desktop\\Word\\Two\\BHWR\\new_weight\\ocr_DenseNet121_GRU', 
+        'C:\\Users\\subha\\OneDrive\\Desktop\\Word\\Two\\BHWR\\new_weight\\ocr_NASNetMobile_GRU',
+        'C:\\Users\\subha\\OneDrive\\Desktop\\Word\\Two\BHWR\\new_weight\\ocr_NASNetMobile_LSTM',]
+
+def get_flops(model_h5_path):
+    tf.compat.v1.reset_default_graph()
+    tf.keras.backend.clear_session()
+    session = tf.compat.v1.Session()
+    graph = tf.compat.v1.get_default_graph()
+
+    with graph.as_default():
+        with session.as_default():
+            model = tf.keras.models.load_model(model_h5_path)
+            run_meta = tf.compat.v1.RunMetadata()
+            opts = tf.compat.v1.profiler.ProfileOptionBuilder.float_operation()
+        
+            # We use the Keras session graph in the call to the profiler.
+            flops = tf.compat.v1.profiler.profile(graph=graph,
+                                                  run_meta=run_meta, cmd='op', options=opts)
+        
+            return flops.total_float_ops
+
+
+for d in dirs[1:]:
+    print(d.split('/')[-1], ":", get_flops(d))
+
+
+# Train the model
+for baseline in list(layer_name.keys())[3:]:
+    model = build_model(baseline, "GRU")
+ 
+    logger = SaveLog(save_path='C:\\Users\\subha\\OneDrive\\Desktop\\Word\\Two\\BHWR\\new_weight', 
+                    monitor='val_loss', 
+                    save_on_epoch=5, patience=early_stopping_patience, 
+                    verbose=False, load_prev=True)
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=epochs,
+        verbose=0,
+        callbacks=[logger],
+        max_queue_size=20,
+    )
+ 
+    #========================================
+    model = build_model(baseline, "LSTM")
+ 
+    logger = SaveLog(save_path='C:\\Users\\subha\\OneDrive\\Desktop\\Word\\Two\\BHWR\\new_weight', 
+                    monitor='val_loss', 
+                    save_on_epoch=5, patience=early_stopping_patience, 
+                    verbose=False, load_prev=True)
+    
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=epochs,
+        verbose=0,
+        callbacks=[logger],
+        max_queue_size=20,
+    )
